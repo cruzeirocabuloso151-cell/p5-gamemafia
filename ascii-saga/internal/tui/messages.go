@@ -6,8 +6,8 @@ import (
 	"github.com/cruzeirocabuloso151-cell/ascii-saga/internal/engine"
 )
 
-// Bubble Tea message types. Keeping them in one file makes the wiring
-// in update.go a single import line.
+// Bubble Tea message types. Streaming events from the engine and
+// internal animation/timing events.
 
 type sceneStartedMsg struct {
 	Blueprint agent.SceneBlueprint
@@ -31,9 +31,19 @@ type sceneErrMsg struct {
 	Err error
 }
 
-type tickMsg struct{}
+// pipelineStageMsg signals which agent is currently doing work.
+// Values: "director" | "master" | "artist" | "judge" | "idle".
+type pipelineStageMsg struct {
+	Stage string
+}
+
+// frameTickMsg drives animations at ~33ms cadence (≈30fps).
+type frameTickMsg struct{}
 
 type llmHealthMsg struct {
 	OK  bool
 	Err error
 }
+
+// themeCycleMsg cycles to the next theme.
+type themeCycleMsg struct{}

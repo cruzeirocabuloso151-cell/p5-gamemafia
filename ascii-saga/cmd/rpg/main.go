@@ -87,9 +87,18 @@ func main() {
 		return
 	}
 
-	model := tui.NewModel(cfg, eng, gs, logger)
-	p := tea.NewProgram(model, tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
+	// Bridge engine streaming events back into the TUI via Program.Send.
+	// The closure captures the pointer lazily so it can be created before
+	// the program exists.
+	var program *tea.Program
+	sender := func(msg tea.Msg) {
+		if program != nil {
+			program.Send(msg)
+		}
+	}
+	model := tui.NewModel(cfg, eng, gs, logger, sender)
+	program = tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	if _, err := program.Run(); err != nil {
 		log.Fatalf("tui: %v", err)
 	}
 }

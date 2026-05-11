@@ -1,0 +1,9 @@
+/bin/
+/dist/
+*.test
+*.out
+saves/*/state.db
+saves/*/state.db-*
+saves/*/vault/scenes/cache_*.txt
+saves/*.log
+ascii-saga.log

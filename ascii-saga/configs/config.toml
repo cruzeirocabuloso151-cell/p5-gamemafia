@@ -1,0 +1,34 @@
+# ascii-saga configuration
+
+[llm]
+# OpenAI-compatible endpoint exposed by LM Studio (or llama.cpp server)
+base_url       = "http://localhost:1234/v1"
+api_key        = "lm-studio"
+model_master   = "google/gemma-3-12b"
+model_director = "google/gemma-3-4b"
+model_artist   = "google/gemma-3-4b"
+model_companion = "google/gemma-3-12b"
+timeout_seconds = 30
+
+[storage]
+# Where saves live. Each campaign gets its own subfolder.
+saves_dir = "./saves"
+campaign  = "default"
+
+[tui]
+theme            = "dark_amber"   # dark_amber | moonlit | parchment
+art_width        = 48
+art_height       = 20
+typewriter_ms    = 18             # ms per character
+min_term_width   = 100
+min_term_height  = 30
+
+[artist]
+# Library of curated ASCII pieces (relative to binary dir or absolute)
+library_dir   = "./internal/assets/library"
+allow_palette = "default"         # default | lineart | shaded
+fallback_on_validation_error = true
+
+[debug]
+log_file       = "./saves/ascii-saga.log"
+log_llm_calls  = true

@@ -10,9 +10,10 @@ Architecture: Plan-and-Execute with critique loop.
     3. Finish.
 
 Usage:
-    python3 bridge.py "sua tarefa aqui"
+    python3 bridge.py "sua tarefa aqui"         # CLI: prints events to stdout
+    python3 bridge.py --serve [port]            # HTTP server with SSE (default 8000)
 
-Both LM Studio servers must be running:
+LM Studio servers expected:
   - Llama  (planner+router+critic) on http://localhost:1234
   - Gemma  (executor)              on http://localhost:1235
 """
@@ -21,14 +22,15 @@ import json
 import sys
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LLAMA_URL = "http://localhost:1234/v1/chat/completions"
 GEMMA_URL = "http://localhost:1235/v1/chat/completions"
 LLAMA_MODEL = "local-llama"
 GEMMA_MODEL = "local-gemma"
 
-MAX_STEP_ITERS = 8        # router turns per step before forcing critique
-MAX_REPLANS = 3           # how many times we accept replan before aborting
+MAX_STEP_ITERS = 8
+MAX_REPLANS = 3
 HTTP_TIMEOUT = 120
 
 
@@ -115,7 +117,6 @@ def call_executor(tool, params, step_context=None):
 
 
 # --- Tool handlers ---------------------------------------------------------
-# Stubs: replace each body with real Playwright/Selenium/CDP calls.
 
 def _h_navigate(params, _exec_out, _vars, browser_state):
     browser_state["url"] = params["url"]
@@ -131,8 +132,6 @@ def _h_type(params, _exec_out, _vars, _browser_state):
 
 
 def _h_eval_js(_params, exec_out, _vars, _browser_state):
-    # exec_out is the JS snippet from Gemma; run it via CDP:
-    # result = page.evaluate(exec_out)
     return {"snippet": exec_out, "result": None}
 
 
@@ -154,7 +153,6 @@ def _h_store(params, _exec_out, vars_dict, _browser_state):
 
 def _h_respond_user(params, exec_out, _vars, _browser_state):
     message = exec_out if exec_out else params["message"]
-    print(f"[agente] {message}")
     return {"ok": True, "message": message}
 
 
@@ -183,7 +181,6 @@ EXECUTOR_TOOLS = {"eval_js", "extract", "respond_user"}
 
 
 def _resolve_refs(value, vars_dict):
-    """Replace '$varname' or '$varname.path' strings with values from vars_dict."""
     if isinstance(value, str) and value.startswith("$"):
         path = value[1:].split(".")
         cur = vars_dict.get(path[0])
@@ -199,10 +196,15 @@ def _resolve_refs(value, vars_dict):
     return value
 
 
-def _execute_calls(calls, vars_dict, browser_state, step_context, step_history, global_history, iteration):
-    """Run one batch of tool calls respecting depends_on. Returns 'step_done'|'finish'|None."""
+# --- Event-emitting core ---------------------------------------------------
+# run_events(task) is a generator that yields ("event_name", payload_dict).
+# Used both by the CLI wrapper and by the SSE server.
+
+def _execute_calls(calls, vars_dict, browser_state, step, step_history, global_history, iteration):
     done = set()
     remaining = list(calls)
+    events = []
+    terminal = None
     while remaining:
         progressed = False
         for call in list(remaining):
@@ -213,7 +215,7 @@ def _execute_calls(calls, vars_dict, browser_state, step_context, step_history, 
 
             exec_out = None
             if tool in EXECUTOR_TOOLS:
-                exec_out = call_executor(tool, params, step_context)
+                exec_out = call_executor(tool, params, step)
 
             handler = TOOL_HANDLERS.get(tool)
             if handler is None:
@@ -231,50 +233,41 @@ def _execute_calls(calls, vars_dict, browser_state, step_context, step_history, 
                 "tool": tool,
                 "params": params,
                 "result": result,
+                "executor_output": exec_out,
             }
             step_history.append(entry)
             global_history.append(entry)
+            events.append(("tool_call", {"step_id": step["id"], **entry}))
 
             if isinstance(result, dict):
                 if result.get("__finish__"):
-                    return "finish"
+                    terminal = "finish"
+                    break
                 if result.get("__step_done__"):
-                    return "step_done"
+                    terminal = "step_done"
+                    break
 
             done.add(call["id"])
             remaining.remove(call)
             progressed = True
+        if terminal:
+            break
         if not progressed:
             raise RuntimeError(f"ciclo em depends_on: {[c['id'] for c in remaining]}")
-    return None
+    return events, terminal
 
 
-def _run_step(task, step, browser_state, vars_dict, global_history):
-    """Run a single step until step_done, finish, or iteration cap."""
-    step_history = []
-    for it in range(MAX_STEP_ITERS):
-        decision = call_step_router(task, step, browser_state, step_history)
-        calls = decision.get("calls", [])
-        if not calls:
-            print(f"[router] step {step['id']} sem ações: {decision.get('reason', '')}")
-            break
-        outcome = _execute_calls(
-            calls, vars_dict, browser_state, step, step_history, global_history, it,
-        )
-        if outcome in ("step_done", "finish"):
-            return outcome, step_history
-    return "iter_cap", step_history
-
-
-def run(task):
+def run_events(task):
     browser_state = {"url": "about:blank"}
     vars_dict = {}
     global_history = []
 
-    plan = call_planner(task)
-    print(f"[planner] {plan.get('reason', '')}")
-    for s in plan["plan"]:
-        print(f"  - {s['id']}: {s['goal']}")
+    try:
+        plan = call_planner(task)
+    except Exception as e:
+        yield ("error", {"message": str(e), "where": "planner"})
+        return
+    yield ("plan", {"steps": plan["plan"], "reason": plan.get("reason", ""), "replan_count": 0})
 
     replans = 0
     step_index = 0
@@ -282,25 +275,58 @@ def run(task):
 
     while step_index < len(steps):
         step = steps[step_index]
-        print(f"[step {step['id']}] {step['goal']}")
-        outcome, step_history = _run_step(task, step, browser_state, vars_dict, global_history)
+        yield ("step_start", {"step_id": step["id"], "goal": step["goal"],
+                              "success_criteria": step.get("success_criteria", "")})
+        step_history = []
+        terminal = None
+        for it in range(MAX_STEP_ITERS):
+            try:
+                decision = call_step_router(task, step, browser_state, step_history)
+            except Exception as e:
+                yield ("error", {"message": str(e), "where": f"router/{step['id']}"})
+                return
+            calls = decision.get("calls", [])
+            if not calls:
+                yield ("router_idle", {"step_id": step["id"], "reason": decision.get("reason", "")})
+                break
+            try:
+                events, terminal = _execute_calls(
+                    calls, vars_dict, browser_state, step, step_history, global_history, it,
+                )
+            except Exception as e:
+                yield ("error", {"message": str(e), "where": f"exec/{step['id']}"})
+                return
+            for ev in events:
+                yield ev
+            if terminal:
+                break
 
-        if outcome == "finish":
-            print("[finish] sessão encerrada pelo router")
+        if terminal == "finish":
+            yield ("done", {"reason": "finish emitido pelo router"})
             return
 
-        verdict = call_critic(task, step, step_history, browser_state, vars_dict)
-        print(f"[critic] {step['id']} succeeded={verdict['step_succeeded']} "
-              f"action={verdict['next_action']} — {verdict.get('reason', '')}")
+        try:
+            verdict = call_critic(task, step, step_history, browser_state, vars_dict)
+        except Exception as e:
+            yield ("error", {"message": str(e), "where": f"critic/{step['id']}"})
+            return
+        yield ("critic", {
+            "step_id": step["id"],
+            "succeeded": verdict["step_succeeded"],
+            "evidence": verdict.get("evidence", ""),
+            "next_action": verdict["next_action"],
+            "feedback": verdict.get("feedback_for_planner", ""),
+            "reason": verdict.get("reason", ""),
+        })
 
         action = verdict["next_action"]
         if action == "abort":
-            print(f"[abort] {verdict.get('reason', 'sem motivo')}")
+            yield ("abort", {"reason": verdict.get("reason", "sem motivo")})
             return
         if action == "replan":
             replans += 1
             if replans > MAX_REPLANS:
-                print(f"[abort] replan limit ({MAX_REPLANS}) excedido")
+                yield ("abort", {"reason": f"replan limit ({MAX_REPLANS}) excedido"})
                 return
             context = {
                 "previous_plan": [s["goal"] for s in steps],
@@ -309,22 +335,134 @@ def run(task):
                 "browser_state": browser_state,
                 "recent_history": global_history[-15:],
             }
-            plan = call_planner(task, context=context)
-            print(f"[planner] replan #{replans}: {plan.get('reason', '')}")
+            try:
+                plan = call_planner(task, context=context)
+            except Exception as e:
+                yield ("error", {"message": str(e), "where": "planner/replan"})
+                return
+            yield ("plan", {"steps": plan["plan"], "reason": plan.get("reason", ""),
+                            "replan_count": replans})
             steps = plan["plan"]
             step_index = 0
             continue
 
-        # next_action == "continue"
-        if not verdict["step_succeeded"] and outcome == "iter_cap":
-            print(f"[warn] step {step['id']} estourou {MAX_STEP_ITERS} iters sem step_done; crítico mandou seguir")
         step_index += 1
 
-    print("[done] plano concluído")
+    yield ("done", {"reason": "plano concluído"})
+
+
+def run(task):
+    """CLI: consume events and print them."""
+    for name, payload in run_events(task):
+        if name == "plan":
+            print(f"[planner] {payload['reason']}")
+            for s in payload["steps"]:
+                print(f"  - {s['id']}: {s['goal']}")
+        elif name == "step_start":
+            print(f"[step {payload['step_id']}] {payload['goal']}")
+        elif name == "tool_call":
+            print(f"  · {payload['tool']} → {json.dumps(payload['result'], ensure_ascii=False)[:120]}")
+        elif name == "critic":
+            mark = "ok" if payload["succeeded"] else "fail"
+            print(f"[critic/{mark}] {payload['step_id']} action={payload['next_action']} — {payload['reason']}")
+        elif name == "router_idle":
+            print(f"[router] idle: {payload['reason']}")
+        elif name in ("done", "abort", "error"):
+            print(f"[{name}] {payload}")
+
+
+# --- SSE server ------------------------------------------------------------
+
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
+
+
+class _AgentHandler(BaseHTTPRequestHandler):
+    def _set_cors(self):
+        for k, v in CORS_HEADERS.items():
+            self.send_header(k, v)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._set_cors()
+        self.end_headers()
+
+    def do_GET(self):
+        if self.path == "/":
+            self.send_response(200)
+            self._set_cors()
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"bridge.py SSE server. POST /run {task}")
+        else:
+            self.send_response(404)
+            self._set_cors()
+            self.end_headers()
+
+    def do_POST(self):
+        if self.path != "/run":
+            self.send_response(404)
+            self._set_cors()
+            self.end_headers()
+            return
+
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            body = json.loads(raw.decode("utf-8"))
+            task = body["task"]
+        except (json.JSONDecodeError, KeyError):
+            self.send_response(400)
+            self._set_cors()
+            self.end_headers()
+            self.wfile.write(b'{"error":"esperado body JSON com {\\"task\\": \\"...\\"}"}')
+            return
+
+        self.send_response(200)
+        self._set_cors()
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        def emit(event_name, payload):
+            data = json.dumps(payload, ensure_ascii=False)
+            chunk = f"event: {event_name}\ndata: {data}\n\n".encode("utf-8")
+            try:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError):
+                return False
+
+        try:
+            for name, payload in run_events(task):
+                if not emit(name, payload):
+                    return
+            emit("close", {})
+        except Exception as e:
+            emit("error", {"message": str(e), "where": "stream"})
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write(f"[server] {fmt % args}\n")
+
+
+def serve(host="127.0.0.1", port=8000):
+    server = ThreadingHTTPServer((host, port), _AgentHandler)
+    print(f"bridge SSE em http://{host}:{port}  (POST /run com body {{\"task\":\"...\"}})")
+    server.serve_forever()
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
-    run(sys.argv[1])
+    if sys.argv[1] == "--serve":
+        port = int(sys.argv[2]) if len(sys.argv) > 2 else 8000
+        serve(port=port)
+    else:
+        run(sys.argv[1])

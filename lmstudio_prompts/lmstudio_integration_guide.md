@@ -1,6 +1,31 @@
 # Guia de Integração — Dois Modelos no LM Studio
 
-Este guia descreve como rodar **Llama Instruct** (router) e **Gemma 3** (executor) simultaneamente no LM Studio, expondo cada um em uma porta diferente para que o `bridge.py` consiga orquestrá-los.
+Este guia descreve como rodar **Llama Instruct** (planner + router + critic) e **Gemma 3** (executor) simultaneamente no LM Studio, expondo cada um em uma porta diferente para que o `bridge.py` consiga orquestrá-los no padrão **Plan-and-Execute** com camada de crítica.
+
+## Arquitetura em uma figura
+
+```
+                    ┌──────────────────────────────────────────┐
+                    │              Llama (porta 1234)           │
+                    │  mode=plan  ┐                             │
+   task ─────────►  │  mode=step  ├─ JSON estruturado            │
+                    │  mode=critique ┘                          │
+                    └──────────────────────────────────────────┘
+                                  ▲          │
+                                  │          ▼
+                          ┌───────┴──────────────┐
+                          │    bridge.py         │  ─ tool handlers ─►  Playwright/CDP
+                          │  (orquestrador)      │
+                          └──────────┬───────────┘
+                                     │ (eval_js, extract, respond_user)
+                                     ▼
+                    ┌──────────────────────────────────────────┐
+                    │           Gemma 3 (porta 1235)            │
+                    │   gera JS / JSON / texto concreto         │
+                    └──────────────────────────────────────────┘
+```
+
+Loop por step: `step-router → executor + tools → critic → continue|replan|abort`.
 
 ## Pré-requisitos
 
@@ -18,12 +43,14 @@ Para máquinas com 16 GB de VRAM, a combinação confortável é **Llama 8B Q4_K
 
 ## Carregando os dois modelos
 
-### Passo 1 — Llama Router (porta 1234)
+### Passo 1 — Llama (porta 1234)
+
+Único servidor Llama atende os três modos (plan / step / critique). O modo é selecionado pelo prefixo `mode:` no input enviado pelo bridge.
 
 1. Abra a aba **Developer** → **Local Server**.
 2. Em **Select a model to load**, escolha o Llama Instruct baixado.
 3. Em **Server Port**, deixe `1234` (default).
-4. Em **System Prompt**, cole o conteúdo de `llama_tool_router.md`.
+4. Em **System Prompt**, cole o conteúdo de `llama_tool_router.md` (já inclui as instruções dos 3 modos).
 5. Clique **Start Server**.
 
 ### Passo 2 — Gemma Executor (porta 1235)
@@ -38,15 +65,17 @@ Se a versão do seu LM Studio não permite duas instâncias na mesma janela, abr
 
 ## Parâmetros recomendados
 
-### Router (Llama, porta 1234)
+### Llama (porta 1234) — todos os modos
 
 | Parâmetro         | Valor   | Por quê                                             |
 |-------------------|---------|-----------------------------------------------------|
 | `temperature`     | `0.05`  | JSON puro exige determinismo                        |
 | `top_p`           | `0.9`   | Cuts long tail                                      |
-| `max_tokens`      | `512`   | Plano por turno é pequeno                           |
+| `max_tokens`      | `1024`  | `plan` precisa de mais espaço que `step`/`critique` |
 | `response_format` | `json_object` (se suportado) | Garante JSON válido           |
 | `stop`            | (vazio) | Não trunque o JSON                                  |
+
+O `bridge.py` já manda `max_tokens` específico por modo (1024 plan, 768 step, 512 critique); o valor da UI é só o teto.
 
 ### Executor (Gemma, porta 1235)
 
@@ -60,21 +89,56 @@ Se a versão do seu LM Studio não permite duas instâncias na mesma janela, abr
 
 Com ambos os servidores no ar, valide com `curl`:
 
-**Router:**
+**Planner (modo `plan`):**
 ```bash
 curl -s http://localhost:1234/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "local-llama",
     "messages": [
-      {"role": "user", "content": "task: abrir https://example.com\nbrowser_state: {\"url\": \"about:blank\"}\nhistory: []"}
+      {"role": "user", "content": "mode: plan\ntask: abrir https://example.com e extrair o título"}
     ],
     "temperature": 0.05,
-    "max_tokens": 512
+    "max_tokens": 1024,
+    "response_format": {"type": "json_object"}
   }'
 ```
 
-Esperado: o `content` da resposta é JSON parseável com pelo menos uma `call` de `navigate`.
+Esperado: `content` é JSON com chave `plan` (lista de steps com `id`, `goal`, `success_criteria`).
+
+**Step router (modo `step`):**
+```bash
+curl -s http://localhost:1234/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local-llama",
+    "messages": [
+      {"role": "user", "content": "mode: step\ntask: abrir https://example.com\ncurrent_step: {\"id\":\"s1\",\"goal\":\"navegar\",\"success_criteria\":\"url == https://example.com\"}\nbrowser_state: {\"url\":\"about:blank\"}\nhistory: []"}
+    ],
+    "temperature": 0.05,
+    "max_tokens": 768,
+    "response_format": {"type": "json_object"}
+  }'
+```
+
+Esperado: JSON com chave `calls` contendo `navigate` + `step_done`.
+
+**Critic (modo `critique`):**
+```bash
+curl -s http://localhost:1234/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local-llama",
+    "messages": [
+      {"role": "user", "content": "mode: critique\ntask: abrir https://example.com\nstep: {\"id\":\"s1\",\"goal\":\"navegar\",\"success_criteria\":\"url == https://example.com\"}\nstep_history: [{\"tool\":\"navigate\",\"result\":{\"status\":200,\"url\":\"https://example.com\"}}]\nfinal_state: {\"browser_state\":{\"url\":\"https://example.com\"},\"vars\":{}}"}
+    ],
+    "temperature": 0.05,
+    "max_tokens": 512,
+    "response_format": {"type": "json_object"}
+  }'
+```
+
+Esperado: JSON com `step_succeeded: true`, `next_action: "continue"` e `evidence` citando a URL.
 
 **Executor:**
 ```bash
@@ -96,8 +160,10 @@ Esperado: o `content` da resposta é `return document.title;` (ou variação equ
 
 | Sintoma                                          | Causa provável                          | Correção                                                            |
 |--------------------------------------------------|-----------------------------------------|---------------------------------------------------------------------|
-| Router devolve texto antes do JSON               | Temperature muito alta                  | Baixe para `0.0`–`0.05`. Ative `response_format: json_object`.      |
-| Router devolve JSON inválido (vírgula sobrando)  | Modelo pequeno demais                   | Suba para Llama 70B Q3, ou troque para um modelo treinado em JSON.  |
+| Llama devolve texto antes do JSON                | Temperature muito alta                  | Baixe para `0.0`–`0.05`. Ative `response_format: json_object`.      |
+| Llama devolve JSON inválido (vírgula sobrando)   | Modelo pequeno demais                   | Suba para Llama 70B Q3, ou troque para um modelo treinado em JSON.  |
+| Critic sempre devolve `step_succeeded: true`     | Modelo concordando demais               | Adicione no prompt do crítico: "se em dúvida, prefira `false`".     |
+| Replans infinitos                                 | `feedback_for_planner` vago             | Verifique se o critic está citando evidência concreta; suba o cap `MAX_REPLANS` só se necessário. |
 | Executor devolve com ```` ``` ```` ao redor       | Prompt não foi colado direito           | Reabra a aba System Prompt e cole de novo. Reinicie o servidor.     |
 | VRAM insuficiente ao carregar o segundo modelo   | Quant alta demais                       | Use Q4_K_M para o router; mantenha o executor em quant maior.       |
 | Latência alta (>10s por turno)                   | Ambos os modelos disputando GPU         | Force o router em CPU (config do LM Studio → "CPU Only").           |

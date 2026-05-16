@@ -3,9 +3,7 @@ name: Deploy web client to GitHub Pages
 
 on:
   push:
-    branches:
-      - main
-      - "claude/lmstudio-dual-model-setup-6I6iS"
+    branches: [main]
     paths:
       - "web/**"
       - ".github/workflows/pages.yml"

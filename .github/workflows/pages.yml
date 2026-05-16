@@ -1,0 +1,59 @@
+# GitHub Pages must be enabled once: Settings → Pages → Source: GitHub Actions.
+name: Deploy web client to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - run: npm ci
+
+      - run: npm run build
+        env:
+          BASE_PATH: /p5-gamemafia/
+
+      # NOTE: actions/configure-pages is intentionally omitted. It only adds
+      # site-URL outputs (unused here) and fails the entire build if Pages is
+      # not yet enabled in the repo. Keeping it out lets the build artifact
+      # always be produced; only the `deploy` job below requires Pages to be
+      # enabled (Settings → Pages → Source: GitHub Actions).
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

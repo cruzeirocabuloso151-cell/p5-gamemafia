@@ -4,12 +4,15 @@ import type {
   AgentState,
   CriticVerdictEntry,
   PlanStep,
+  ScreenshotEntry,
   StepStatus,
   ToolCallEntry,
 } from "../types";
 
 const initialState: AgentState = {
   status: "idle",
+  runId: null,
+  task: "",
   steps: [],
   stepStatus: {},
   currentStepId: null,
@@ -17,16 +20,22 @@ const initialState: AgentState = {
   replanCount: 0,
   toolCalls: [],
   verdicts: [],
+  latestScreenshot: null,
+  screenshots: [],
+  vars: {},
   lastError: null,
 };
 
 type Action =
   | { kind: "reset" }
-  | { kind: "start" }
+  | { kind: "start"; task: string }
+  | { kind: "run_start"; runId: string; task: string }
   | { kind: "plan"; steps: PlanStep[]; reason: string; replanCount: number }
   | { kind: "step_start"; stepId: string }
   | { kind: "tool_call"; entry: ToolCallEntry }
   | { kind: "critic"; verdict: CriticVerdictEntry }
+  | { kind: "screenshot"; shot: ScreenshotEntry }
+  | { kind: "vars"; vars: Record<string, unknown> }
   | { kind: "done" }
   | { kind: "abort"; reason: string }
   | { kind: "error"; message: string };
@@ -36,7 +45,9 @@ function reducer(state: AgentState, a: Action): AgentState {
     case "reset":
       return initialState;
     case "start":
-      return { ...initialState, status: "running" };
+      return { ...initialState, status: "running", task: a.task };
+    case "run_start":
+      return { ...state, runId: a.runId, task: a.task };
     case "plan": {
       const stepStatus: Record<string, StepStatus> = {};
       a.steps.forEach((s) => (stepStatus[s.id] = "pending"));
@@ -71,6 +82,14 @@ function reducer(state: AgentState, a: Action): AgentState {
         stepStatus: { ...state.stepStatus, [a.verdict.step_id]: newStatus },
       };
     }
+    case "screenshot":
+      return {
+        ...state,
+        latestScreenshot: a.shot,
+        screenshots: [...state.screenshots, a.shot],
+      };
+    case "vars":
+      return { ...state, vars: a.vars };
     case "done":
       return { ...state, status: "done", currentStepId: null };
     case "abort":
@@ -84,8 +103,7 @@ function reducer(state: AgentState, a: Action): AgentState {
 
 function parseSseChunk(chunk: string): AgentEvent[] {
   const events: AgentEvent[] = [];
-  const blocks = chunk.split("\n\n");
-  for (const block of blocks) {
+  for (const block of chunk.split("\n\n")) {
     if (!block.trim()) continue;
     let eventName = "";
     const dataLines: string[] = [];
@@ -103,6 +121,15 @@ function parseSseChunk(chunk: string): AgentEvent[] {
     }
     const p = parsed as Record<string, unknown>;
     switch (eventName) {
+      case "run_start":
+        events.push({
+          type: "run_start",
+          run_id: p.run_id as string,
+          task: p.task as string,
+          config: p.config as AgentEvent extends { type: "run_start"; config: infer C } ? C : never,
+          credentials_known: (p.credentials_known as string[]) ?? [],
+        });
+        break;
       case "plan":
         events.push({
           type: "plan",
@@ -129,6 +156,24 @@ function parseSseChunk(chunk: string): AgentEvent[] {
         events.push({
           type: "critic",
           verdict: { ...(p as unknown as CriticVerdictEntry), timestamp: Date.now() },
+        });
+        break;
+      case "screenshot":
+        events.push({
+          type: "screenshot",
+          shot: {
+            step_id: p.step_id as string,
+            after_tool: p.after_tool as string,
+            data_url: p.data_url as string,
+            url: (p.url as string) ?? null,
+            timestamp: Date.now(),
+          },
+        });
+        break;
+      case "vars_snapshot":
+        events.push({
+          type: "vars_snapshot",
+          vars: (p.vars as Record<string, unknown>) ?? {},
         });
         break;
       case "router_idle":
@@ -168,7 +213,7 @@ export function useAgentStream(endpoint: string) {
       abortRef.current?.abort();
       const controller = new AbortController();
       abortRef.current = controller;
-      dispatch({ kind: "start" });
+      dispatch({ kind: "start", task });
 
       let resp: Response;
       try {
@@ -192,50 +237,22 @@ export function useAgentStream(endpoint: string) {
       const decoder = new TextDecoder();
       let buffer = "";
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lastBreak = buffer.lastIndexOf("\n\n");
-        if (lastBreak === -1) continue;
-        const ready = buffer.slice(0, lastBreak + 2);
-        buffer = buffer.slice(lastBreak + 2);
-
-        for (const ev of parseSseChunk(ready)) {
-          switch (ev.type) {
-            case "plan":
-              dispatch({
-                kind: "plan",
-                steps: ev.steps,
-                reason: ev.reason,
-                replanCount: ev.replan_count,
-              });
-              break;
-            case "step_start":
-              dispatch({ kind: "step_start", stepId: ev.step_id });
-              break;
-            case "tool_call":
-              dispatch({ kind: "tool_call", entry: ev.entry });
-              break;
-            case "critic":
-              dispatch({ kind: "critic", verdict: ev.verdict });
-              break;
-            case "done":
-              dispatch({ kind: "done" });
-              break;
-            case "abort":
-              dispatch({ kind: "abort", reason: ev.reason });
-              break;
-            case "error":
-              dispatch({
-                kind: "error",
-                message: ev.where ? `${ev.where}: ${ev.message}` : ev.message,
-              });
-              break;
-            case "router_idle":
-            case "close":
-              break;
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lastBreak = buffer.lastIndexOf("\n\n");
+          if (lastBreak === -1) continue;
+          const ready = buffer.slice(0, lastBreak + 2);
+          buffer = buffer.slice(lastBreak + 2);
+          for (const ev of parseSseChunk(ready)) {
+            applyEvent(ev, dispatch);
           }
+        }
+      } catch (e) {
+        if ((e as Error).name !== "AbortError") {
+          dispatch({ kind: "error", message: (e as Error).message });
         }
       }
     },
@@ -253,4 +270,50 @@ export function useAgentStream(endpoint: string) {
   }, []);
 
   return { state, run, cancel, reset };
+}
+
+function applyEvent(ev: AgentEvent, dispatch: React.Dispatch<Action>) {
+  switch (ev.type) {
+    case "run_start":
+      dispatch({ kind: "run_start", runId: ev.run_id, task: ev.task });
+      break;
+    case "plan":
+      dispatch({
+        kind: "plan",
+        steps: ev.steps,
+        reason: ev.reason,
+        replanCount: ev.replan_count,
+      });
+      break;
+    case "step_start":
+      dispatch({ kind: "step_start", stepId: ev.step_id });
+      break;
+    case "tool_call":
+      dispatch({ kind: "tool_call", entry: ev.entry });
+      break;
+    case "critic":
+      dispatch({ kind: "critic", verdict: ev.verdict });
+      break;
+    case "screenshot":
+      dispatch({ kind: "screenshot", shot: ev.shot });
+      break;
+    case "vars_snapshot":
+      dispatch({ kind: "vars", vars: ev.vars });
+      break;
+    case "done":
+      dispatch({ kind: "done" });
+      break;
+    case "abort":
+      dispatch({ kind: "abort", reason: ev.reason });
+      break;
+    case "error":
+      dispatch({
+        kind: "error",
+        message: ev.where ? `${ev.where}: ${ev.message}` : ev.message,
+      });
+      break;
+    case "router_idle":
+    case "close":
+      break;
+  }
 }

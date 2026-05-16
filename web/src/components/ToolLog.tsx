@@ -14,6 +14,11 @@ function fmt(value: unknown): string {
   }
 }
 
+function copy(value: unknown) {
+  const s = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  navigator.clipboard.writeText(s).catch(() => {});
+}
+
 export function ToolLog({ calls }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -34,13 +39,16 @@ export function ToolLog({ calls }: Props) {
             <span className="tag iter">it{c.iter}</span>
             <span className="tag tool">{c.tool}</span>
             <span className="tag id">{c.id}</span>
+            <button className="copy-btn" title="copiar JSON da call inteira" onClick={() => copy(c)}>
+              copiar
+            </button>
           </div>
           <div className="log-params">
             <span className="lbl">params</span> <code>{fmt(c.params)}</code>
           </div>
           {c.executor_output && (
             <div className="log-exec">
-              <span className="lbl">gemma</span>{" "}
+              <span className="lbl">exec</span>{" "}
               <code>
                 {c.executor_output.length > 240
                   ? c.executor_output.slice(0, 240) + "…"

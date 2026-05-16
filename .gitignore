@@ -1,0 +1,9 @@
+# credentials managed by bridge.py — never commit
+lmstudio_prompts/.credentials.json
+.credentials.json
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/

@@ -76,14 +76,16 @@ type StreamEvent struct {
 
 // RunScene executes the full pipeline for one player input.
 //
-// Streaming model:
-//   - The blueprint comes back as a "title" event ASAP.
-//   - Art is computed in parallel; arrives as "art_ready".
-//   - Narrative chunks stream as "narrative_chunk" events.
-//   - When the narrative finishes, companions react and we splice their
-//     lines in for the consolidated final text. "scene_done" closes.
+// Streaming events emitted via emit():
+//   - "stage" + payload string in {"director","master","artist","judge","idle"}
+//   - "title" + SceneBlueprint
+//   - "art_started" (signal for spinner) and "art_ready" + RenderResult
+//   - "narrative_chunk" + string, then "narrative_done"
+//   - "scene_done" + SceneOutput
 func (e *Engine) RunScene(ctx context.Context, playerInput string, emit func(StreamEvent)) (SceneOutput, error) {
 	out := SceneOutput{}
+
+	emit(StreamEvent{Kind: "stage", Payload: "director"})
 
 	// Director — quick, blocking. Without it, the rest has no rails.
 	planCtx := e.buildPlanContext(playerInput)
@@ -93,6 +95,9 @@ func (e *Engine) RunScene(ctx context.Context, playerInput string, emit func(Str
 	}
 	out.Blueprint = bp
 	emit(StreamEvent{Kind: "title", Payload: bp})
+
+	emit(StreamEvent{Kind: "art_started", Payload: nil})
+	emit(StreamEvent{Kind: "stage", Payload: "artist"})
 
 	// Kick off Artist in parallel.
 	artCh := make(chan assets.RenderResult, 1)
@@ -105,6 +110,8 @@ func (e *Engine) RunScene(ctx context.Context, playerInput string, emit func(Str
 		})
 	}()
 
+	emit(StreamEvent{Kind: "stage", Payload: "master"})
+
 	// Master — streams.
 	dossier := e.buildCharacterDossier()
 	var rawNarr strings.Builder
@@ -114,7 +121,9 @@ func (e *Engine) RunScene(ctx context.Context, playerInput string, emit func(Str
 	}, func(chunk string) {
 		rawNarr.WriteString(chunk)
 		// Hide scene_meta delta from the player as it streams.
-		emit(StreamEvent{Kind: "narrative_chunk", Payload: hideMetaDelta(chunk)})
+		if visible := hideMetaDelta(chunk); visible != "" {
+			emit(StreamEvent{Kind: "narrative_chunk", Payload: visible})
+		}
 	})
 	if err != nil {
 		e.Logger.Error("master narrate", "err", err)
@@ -135,6 +144,8 @@ func (e *Engine) RunScene(ctx context.Context, playerInput string, emit func(Str
 	out.Narrative = strings.TrimSpace(narr)
 	out.Meta = meta
 
+	emit(StreamEvent{Kind: "stage", Payload: "judge"})
+
 	// Judge — deterministic state mutation.
 	out.Events = e.Judge.Apply(e.GameState, meta)
 	for _, ev := range out.Events {
@@ -151,6 +162,7 @@ func (e *Engine) RunScene(ctx context.Context, playerInput string, emit func(Str
 		e.Logger.Error("autosave", "err", err)
 	}
 
+	emit(StreamEvent{Kind: "stage", Payload: "idle"})
 	emit(StreamEvent{Kind: "scene_done", Payload: out})
 	return out, nil
 }

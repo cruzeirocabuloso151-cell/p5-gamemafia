@@ -1,0 +1,32 @@
+# ══════════════════════════════════════════════════════════
+# Configuração central do game-agent-orchestra
+# ══════════════════════════════════════════════════════════
+
+# URL do servidor LM Studio (OpenAI-compatible)
+lm_studio_url: http://localhost:2234/v1
+
+# Modelo principal (texto, streaming + thinking)
+model_main: gemma-3-12b-it
+
+# Modelo de visão (descrição de imagens)
+model_vision: qwen2.5-vl-7b-instruct
+
+# Parâmetros de geração
+temperature: 0.75
+max_tokens: 4096
+
+# Browser (Playwright)
+browser_headless: true
+max_pages_per_query: 3
+max_images_per_page: 4
+max_queries_browser: 5        # quantas das 7 queries o Browser realmente navega
+max_images_vision: 6          # quantas imagens o agente Vision descreve
+
+# Timeout de segurança por agente (segundos)
+agent_timeout_seconds: 180
+
+# Pasta onde os recursos de cada run são salvos
+resources_dir: resources
+
+# Banco SQLite
+database_path: orchestra.db

@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Banco e recursos gerados em runtime
+orchestra.db
+resources/*
+!resources/.gitkeep
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
